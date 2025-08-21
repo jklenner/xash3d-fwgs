@@ -1532,10 +1532,8 @@ static int NET_SendLong(netsrc_t sock, int net_socket, const char *buf, size_t l
     ret = g_sendto(sock, fragments, sizes, packet_count, sequence_number, to, tolen);
 
 cleanup:
-    if (fragment_data_block) free(fragment_data_block);
-    if (fragments && fragments[0] != buf) {
-        for (int i = 0; i < packet_count; ++i)
-            free(fragments[i]);
+    if (fragment_data_block) {
+	free(fragment_data_block);
     }
     free(fragments);
     free(sizes);
