@@ -89,6 +89,11 @@ void *COM_LoadLibrary( const char *dllname, int build_ordinals_table, qboolean d
 #ifdef Platform_POSIX_LoadLibrary
 	return Platform_POSIX_LoadLibrary( dllname );
 #endif
+	int flags = RTLD_NOW;
+	// If this is Metamod, allow its symbols globally for plugins:
+	if (strstr(hInst->shortPath, "addons/metamod/dlls/metamod.so"))
+    		flags |= RTLD_GLOBAL;
+
 
 	// platforms where gameinfo mechanism is working goes here
 	// and use FS_FindLibrary
@@ -106,7 +111,7 @@ void *COM_LoadLibrary( const char *dllname, int build_ordinals_table, qboolean d
 		// try to find by linker(LD_LIBRARY_PATH, DYLD_LIBRARY_PATH, LD_32_LIBRARY_PATH and so on...)
 		if( !pHandle )
 		{
-			pHandle = dlopen( dllname, RTLD_NOW | RTLD_GLOBAL );
+			pHandle = dlopen( dllname, flags);
 			if( pHandle )
 				return pHandle;
 
@@ -147,7 +152,7 @@ void *COM_LoadLibrary( const char *dllname, int build_ordinals_table, qboolean d
 	else
 #endif
 	{
-		if( !( hInst->hInstance = dlopen( hInst->fullPath, RTLD_NOW | RTLD_GLOBAL ) ) )
+		if( !( hInst->hInstance = dlopen( hInst->fullPath, flags) ) )
 		{
 			COM_PushLibraryError( dlerror() );
 			Mem_Free( hInst );
