@@ -26,7 +26,6 @@ GNU General Public License for more details.
 #include "server.h"
 #include "platform/android/lib_android.h"
 #include "platform/apple/lib_ios.h"
-#include <string.h>
 
 #ifdef XASH_DLL_LOADER // wine-based dll loader
 void * Loader_LoadLibrary (const char *name);
@@ -83,7 +82,6 @@ void *COM_LoadLibrary( const char *dllname, int build_ordinals_table, qboolean d
 	dll_user_t *hInst = NULL;
 	void *pHandle = NULL;
 	char buf[MAX_VA_STRING];
-	int flags = RTLD_NOW;
 
 	COM_ResetLibraryError();
 
@@ -91,6 +89,7 @@ void *COM_LoadLibrary( const char *dllname, int build_ordinals_table, qboolean d
 #ifdef Platform_POSIX_LoadLibrary
 	return Platform_POSIX_LoadLibrary( dllname );
 #endif
+
 	// platforms where gameinfo mechanism is working goes here
 	// and use FS_FindLibrary
 	hInst = FS_FindLibrary( dllname, directpath );
@@ -107,7 +106,7 @@ void *COM_LoadLibrary( const char *dllname, int build_ordinals_table, qboolean d
 		// try to find by linker(LD_LIBRARY_PATH, DYLD_LIBRARY_PATH, LD_32_LIBRARY_PATH and so on...)
 		if( !pHandle )
 		{
-			pHandle = dlopen( dllname, RTLD_NOW);
+			pHandle = dlopen( dllname, RTLD_NOW );
 			if( pHandle )
 				return pHandle;
 
@@ -148,18 +147,7 @@ void *COM_LoadLibrary( const char *dllname, int build_ordinals_table, qboolean d
 	else
 #endif
 	{
-		flags = RTLD_NOW;
-		if( hInst
-		 && (
-		        (hInst->shortPath && (strstr( hInst->shortPath, "metamod.so" )
-		                           || strstr( hInst->shortPath, "/metamod/" )))
-		     ||  strstr( hInst->fullPath, "metamod.so" )
-		    )
-		   )
-		{
-			flags |= RTLD_GLOBAL;
-		}
-		if( !( hInst->hInstance = dlopen( hInst->fullPath, flags) ) )
+		if( !( hInst->hInstance = dlopen( hInst->fullPath, RTLD_NOW ) ) )
 		{
 			COM_PushLibraryError( dlerror() );
 			Mem_Free( hInst );
