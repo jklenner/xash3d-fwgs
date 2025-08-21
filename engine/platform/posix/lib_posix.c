@@ -106,7 +106,7 @@ void *COM_LoadLibrary( const char *dllname, int build_ordinals_table, qboolean d
 		// try to find by linker(LD_LIBRARY_PATH, DYLD_LIBRARY_PATH, LD_32_LIBRARY_PATH and so on...)
 		if( !pHandle )
 		{
-			pHandle = dlopen( dllname, RTLD_NOW );
+			pHandle = dlopen( dllname, RTLD_NOW | RTLD_GLOBAL );
 			if( pHandle )
 				return pHandle;
 
@@ -147,7 +147,7 @@ void *COM_LoadLibrary( const char *dllname, int build_ordinals_table, qboolean d
 	else
 #endif
 	{
-		if( !( hInst->hInstance = dlopen( hInst->fullPath, RTLD_NOW ) ) )
+		if( !( hInst->hInstance = dlopen( hInst->fullPath, RTLD_NOW | RTLD_GLOBAL ) ) )
 		{
 			COM_PushLibraryError( dlerror() );
 			Mem_Free( hInst );
