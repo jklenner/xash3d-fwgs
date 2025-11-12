@@ -27,6 +27,7 @@ GNU General Public License for more details.
 #if XASH_WIN32
 #include <direct.h>
 #include <io.h>
+#include "utflib.h"
 #elif XASH_DOS4GW
 #include <direct.h>
 #else
@@ -50,6 +51,18 @@ GNU General Public License for more details.
 
 #define FILE_COPY_SIZE		(1024 * 1024)
 #define SAVE_AGED_COUNT 2 // the default count of quick and auto saves
+
+#if !defined( O_BINARY )
+	#define O_BINARY 0
+#endif // !defined( O_BINARY )
+
+#if !defined( O_TEXT )
+	#define O_TEXT 0
+#endif // !defined( O_TEXT )
+
+#if !XASH_PSVITA && !XASH_NSWITCH
+	#define HAVE_DUP
+#endif // !XASH_PSVITA && !XASH_NSWITCH
 
 fs_globals_t FI;
 poolhandle_t  fs_mempool;
@@ -357,7 +370,11 @@ void FS_CreatePath( char *path )
 			// create the directory
 			save = *ofs;
 			*ofs = 0;
-			_mkdir( path );
+#if XASH_WIN32
+			_mkdir( path ); // use _wmkdir maybe?
+#else // !XASH_WIN32
+			mkdir( path, S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH );
+#endif // !XASH_WIN32
 			*ofs = save;
 		}
 	}
@@ -576,7 +593,7 @@ FS_WriteGameInfo
 assume GameInfo is valid
 ================
 */
-static qboolean FS_WriteGameInfo( const char *filepath, gameinfo_t *GameInfo )
+static qboolean FS_WriteGameInfo( const char *filepath, const gameinfo_t *GameInfo )
 {
 	file_t	*f = FS_Open( filepath, "w", false ); // we in binary-mode
 	int	i, write_ambients = false;
@@ -697,8 +714,8 @@ static qboolean FS_WriteGameInfo( const char *filepath, gameinfo_t *GameInfo )
 		FS_Printf( f, "hd_background\t\t%i\n", GameInfo->hd_background );
 
 	// always expose our extensions :)
-	FS_Printf( f, "internal_vgui_support\t\t%s\n", GameInfo->internal_vgui_support ? "1" : "0" );
-	FS_Printf( f, "render_picbutton_text\t\t%s\n", GameInfo->render_picbutton_text ? "1" : "0" );
+	FS_Printf( f, "internal_vgui_support\t\t%i\n", GameInfo->internal_vgui_support );
+	FS_Printf( f, "render_picbutton_text\t\t%i\n", GameInfo->render_picbutton_text );
 
 	if( COM_CheckStringEmpty( GameInfo->demomap ))
 		FS_Printf( f, "demomap\t\t\"%s\"\n", GameInfo->demomap );
@@ -1364,8 +1381,23 @@ void FS_Rescan( uint32_t flags, const char *language )
 	if( Q_stricmp( GI->basedir, GI->falldir ) && Q_stricmp( GI->gamefolder, GI->falldir ))
 		FS_AddGameHierarchy( GI->falldir, flags );
 
-	GI->added = true;
+	((gameinfo_t *)GI)->added = true; // getting rid of const here, as this modifier only for the engine
 	FS_AddGameHierarchy( GI->gamefolder, FS_GAMEDIR_PATH | flags );
+}
+
+/*
+===============
+FS_Gamedir
+
+Allows engine to know game directory before gameinfo is initialized
+===============
+*/
+static const char *FS_Gamedir( void )
+{
+	if( GI )
+		return GI->gamefolder;
+
+	return fs_gamedir;
 }
 
 /*
@@ -1375,17 +1407,14 @@ FS_LoadGameInfo
 can be passed null arg
 ================
 */
-void FS_LoadGameInfo( const char *rootfolder )
+static void FS_LoadGameInfo( uint32_t flags, const char *language )
 {
 	int	i;
 
 	// lock uplevel of gamedir for read\write
 	FS_AllowDirectPaths( false );
 
-	if( rootfolder )
-		Q_strncpy( fs_gamedir, rootfolder, sizeof( fs_gamedir ));
-
-	Con_Reportf( "%s( %s )\n", __func__, fs_gamedir );
+	Con_Reportf( "%s( %s, 0x%x, %s )\n", __func__, fs_gamedir, flags, language );
 
 	// clear any old paths
 	FS_ClearSearchPath();
@@ -1410,7 +1439,7 @@ void FS_LoadGameInfo( const char *rootfolder )
 		FS_CreatePath( buf );
 	}
 
-	FS_Rescan( 0, NULL ); // create new filesystem
+	FS_Rescan( flags, language ); // create new filesystem
 }
 
 /*
@@ -1909,7 +1938,7 @@ file_t *FS_SysOpen( const char *filepath, const char *mode )
 		// through fcntl() and MFD_ALLOW_SEALING we could enforce
 		// read-write flags but we don't really care about them yet
 		if( fd < 0 )
-			Con_Printf( S_ERROR "%s: can't create anonymous file %s: %s", __func__, filepath, strerror( errno ));
+			Con_Printf( S_WARN "%s: can't create anonymous file %s: %s\n", __func__, filepath, strerror( errno ));
 		else memfile = true;
 #endif
 		// if it's unsupported, we can open it on disk
@@ -3461,6 +3490,7 @@ const fs_api_t g_api =
 	FS_Path_f,
 
 	// gameinfo utils
+	FS_Gamedir,
 	FS_LoadGameInfo,
 
 	// file ops

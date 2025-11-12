@@ -19,10 +19,16 @@ GNU General Public License for more details.
 #include "xash3d_mathlib.h"
 #include "ipv6text.h"
 #include "net_ws_private.h"
+#include "server.h" // sv_cheats
 
 #if XASH_SDL == 2
 #include <SDL_thread.h>
 #endif
+
+#if XASH_LIB_OUTPUT
+#include "platform/lib/net_lib.h"
+#endif
+
 
 #define NET_USE_FRAGMENTS
 
@@ -142,7 +148,6 @@ static inline qboolean NET_IsSocketError( int retval )
 
 static inline qboolean NET_IsSocketValid( int socket )
 {
-	return true;
 #if XASH_WIN32 || XASH_DOS4GW
 	return socket != INVALID_SOCKET;
 #else
@@ -237,7 +242,6 @@ NET_GetHostByName
 */
 static qboolean NET_GetHostByName( const char *hostname, int family, struct sockaddr_storage *addr )
 {
-#if defined HAVE_GETADDRINFO
 	struct addrinfo *ai = NULL, *cur;
 	struct addrinfo hints;
 	qboolean ret = false;
@@ -267,29 +271,8 @@ static qboolean NET_GetHostByName( const char *hostname, int family, struct sock
 	}
 
 	return ret;
-#else
-	struct hostent *h;
-
-#if XASH_NO_IPV6_RESOLVE
-	if( family == AF_INET6 )
-		return false;
-#endif
-
-	if(!( h = gethostbyname( hostname )))
-		return false;
-
-	((struct sockaddr_in *)addr)->sin_family = AF_INET;
-	((struct sockaddr_in *)addr)->sin_addr = *(struct in_addr *)h->h_addr_list[0];
-
-	return true;
-#endif
 }
 
-#if !XASH_EMSCRIPTEN && !XASH_DOS4GW && !defined XASH_NO_ASYNC_NS_RESOLVE
-#define CAN_ASYNC_NS_RESOLVE
-#endif // !XASH_EMSCRIPTEN && !XASH_DOS4GW && !defined XASH_NO_ASYNC_NS_RESOLVE
-
-#ifdef CAN_ASYNC_NS_RESOLVE
 static void NET_ResolveThread( void );
 
 #if XASH_SDL == 2
@@ -380,11 +363,7 @@ static void NET_ResolveThread( void )
 
 	RESOLVE_DBG( "[resolve thread] starting resolve for " );
 	RESOLVE_DBG( nsthread.hostname );
-#ifdef HAVE_GETADDRINFO
 	RESOLVE_DBG( " with getaddrinfo\n" );
-#else
-	RESOLVE_DBG( " with gethostbyname\n" );
-#endif
 
 	if(( res = NET_GetHostByName( nsthread.hostname, nsthread.family, &addr )))
 		RESOLVE_DBG( "[resolve thread] success\n" );
@@ -398,8 +377,6 @@ static void NET_ResolveThread( void )
 	mutex_unlock( nsthread.mutexres );
 	RESOLVE_DBG( "[resolve thread] exiting thread\n" );
 }
-#endif // CAN_ASYNC_NS_RESOLVE
-
 
 /*
 =============
@@ -457,7 +434,6 @@ net_gai_state_t NET_StringToSockaddr( const char *s, struct sockaddr_storage *sa
 	{
 		qboolean asyncfailed = true;
 
-#ifdef CAN_ASYNC_NS_RESOLVE
 		if( net.threads_initialized && nonblocking )
 		{
 			mutex_lock( nsthread.mutexres );
@@ -499,7 +475,6 @@ net_gai_state_t NET_StringToSockaddr( const char *s, struct sockaddr_storage *sa
 
 			mutex_unlock( nsthread.mutexres );
 		}
-#endif // CAN_ASYNC_NS_RESOLVE
 
 		if( asyncfailed )
 			ret = NET_GetHostByName( copy, family, &temp );
@@ -1140,7 +1115,7 @@ static void NET_AdjustLag( void )
 	dt = bound( 0.0, dt, 0.1 );
 	lasttime = host.realtime;
 
-	if( host_developer.value || !net_fakelag.value )
+	if(( host_developer.value && sv_cheats.value ) || !net_fakelag.value )
 	{
 		if( net_fakelag.value != net.fakelag )
 		{
@@ -1353,12 +1328,6 @@ static qboolean NET_GetLong( byte *pData, int size, size_t *outSize, int splitsi
 	return false;
 }
 
-static recvfrom_func_t g_recvfrom = NULL;
-
-void RegisterRecvFromCallback(recvfrom_func_t fn) {
-    g_recvfrom = fn;
-}
-
 /*
 ==================
 NET_QueuePacket
@@ -1376,7 +1345,7 @@ static qboolean NET_QueuePacket( netsrc_t sock, netadr_t *from, byte *data, size
 
 	*length = 0;
 
-	for( protocol = 0; protocol < 1; protocol++ )
+	for( protocol = 0; protocol < 2; protocol++ )
 	{
 		switch( protocol )
 		{
@@ -1388,7 +1357,7 @@ static qboolean NET_QueuePacket( netsrc_t sock, netadr_t *from, byte *data, size
 			continue;
 
 		addr_len = sizeof( addr );
-		ret = g_recvfrom( net_socket, buf, sizeof( buf ), 0, (struct sockaddr *)&addr, &addr_len );
+		ret = recvfrom( net_socket, buf, sizeof( buf ), 0, (struct sockaddr *)&addr, &addr_len );
 
 		NET_SockadrToNetadr( &addr, from );
 
@@ -1465,12 +1434,55 @@ qboolean NET_GetPacket( netsrc_t sock, netadr_t *from, byte *data, size_t *lengt
 	}
 }
 
-static sendto_func_t g_sendto = NULL;
+#if !XASH_LIB_OUTPUT && NET_USE_SEND_BATCH
+int sendto_batch(int sock,
+                 char *fragments[],
+                 int sizes[],
+                 int count,
+                 int flags,
+                 const struct sockaddr *to,
+                 int tolen)
+{
+    register int i;
+    register int total_sent = 0;
+    register int ret;
 
-void RegisterSendToCallback(sendto_func_t fn) {
-    g_sendto = fn;
+    /* Fast sanity check */
+    if (sock < 0 || fragments == NULL || sizes == NULL ||
+        count <= 0 || to == NULL || tolen <= 0)
+    {
+        return -1;
+    }
+
+    /* Tight inner loop — relies on CPU branch prediction */
+    for (i = 0; i < count; ++i)
+    {
+        register char *frag = fragments[i];
+        register int len = sizes[i];
+
+        /* Skip invalid entries fast */
+        if (frag == NULL || len <= 0)
+            continue;
+
+        /* Direct call — avoid indirect function overhead */
+        ret = sendto(sock, frag, len, flags, to, tolen);
+        if (ret < 0)
+        {
+            /* Immediately stop on first error */
+            return ret;
+        }
+
+        /* Compute payload-only count; guard against undersized sends */
+        if (ret >= len)
+            total_sent += (len - (int)sizeof(SPLITPACKET));
+        else if (ret > (int)sizeof(SPLITPACKET))
+            total_sent += (ret - (int)sizeof(SPLITPACKET));
+        /* else: ignore if header-only was sent */
+    }
+
+    return total_sent;
 }
-
+#endif
 
 /*
 ==================
@@ -1479,78 +1491,180 @@ NET_SendLong
 Fragment long packets, send short directly
 ==================
 */
-static int NET_SendLong(netsrc_t sock, int net_socket, const char *buf, size_t len, int flags,
-                        const struct sockaddr_storage *to, size_t tolen, size_t splitsize)
+static int NET_SendLong(
+    netsrc_t sock,
+    int net_socket,
+    const char *buf,
+    size_t len,
+    int flags,
+    const struct sockaddr_storage *to,
+    size_t tolen,
+    size_t splitsize)
 {
-    int packet_count = 1, sequence_number = 0, total_size = 0, ret = 0;
-    char *fragment_data_block = NULL;
-    char **fragments = NULL;
-    SPLITPACKET *p = NULL;
-    size_t *sizes = NULL;
-    size_t fragment_size = 0;
-    size_t block_size = 0;
+    /* Early validation */
+    if (!buf || !to || len == 0)
+        return -1;
 
-    if (splitsize > sizeof(SPLITPACKET) && sock == NS_SERVER && len > splitsize)
+    /* Fast path for short packets */
+    if (splitsize <= sizeof(SPLITPACKET) || sock != NS_SERVER || len <= splitsize)
     {
-        // Fragmented path
-        int body_size = splitsize - sizeof(SPLITPACKET);
-        packet_count = (len + body_size - 1) / body_size;
+        if (len > (size_t)INT_MAX)
+            return -1;
+        return sendto(net_socket, buf, (int)len, flags,
+                      (const struct sockaddr *)to, (int)tolen);
+    }
 
-        sequence_number = ++net.sequence_number;
-        if (sequence_number <= 0)
-            sequence_number = net.sequence_number = 1;
+#ifndef NET_USE_FRAGMENTS
+    /* Fallback if fragments disabled */
+    if (len > (size_t)INT_MAX)
+        return -1;
+    return sendto(net_socket, buf, (int)len, flags,
+                  (const struct sockaddr *)to, (int)tolen);
+#else /* NET_USE_FRAGMENTS defined */
 
-        fragment_size = sizeof(SPLITPACKET) + body_size;
-        block_size = fragment_size * packet_count;
+    const size_t hdr_size = sizeof(SPLITPACKET);
+    int body_size;
+    size_t packet_count;
+    SPLITPACKET base_hdr;
 
-        fragment_data_block = malloc(block_size);
-        fragments = malloc(packet_count * sizeof(char *));
-        sizes = malloc(packet_count * sizeof(size_t));
-        if (!fragment_data_block || !fragments || !sizes)
-            goto cleanup;
+    body_size = (int)(splitsize - hdr_size);
+    if (body_size <= 0)
+        return -1;
 
-        for (int i = 0; i < packet_count; ++i)
+    packet_count = (len + (size_t)body_size - 1u) / (size_t)body_size;
+    if (packet_count == 0 || packet_count > 8192u)
+        return -1;
+
+    base_hdr.sequence_number = ++net.sequence_number;
+    if (base_hdr.sequence_number <= 0)
+        base_hdr.sequence_number = 1;
+    base_hdr.net_id = NET_HEADER_SPLITPACKET;
+
+#ifdef NET_USE_SEND_BATCH
+    {
+        /* ---- BATCH MODE ---- */
+        size_t meta_size;
+        size_t per_packet_size;
+        size_t data_size;
+        size_t total_alloc;
+        char *mem;
+        char **fragments;
+        int *sizes;
+        char *packet_data;
+        const char *src;
+        char *dst;
+        size_t remain;
+        size_t i;
+        int ret;
+        int total_sent;
+
+        meta_size = packet_count * (sizeof(char *) + sizeof(int));
+        per_packet_size = hdr_size + (size_t)body_size;
+        data_size = packet_count * per_packet_size;
+        total_alloc = meta_size + data_size;
+
+#if defined(_POSIX_C_SOURCE) && _POSIX_C_SOURCE >= 200112L
+        if (posix_memalign((void **)&mem, 64, total_alloc) != 0)
+            return -1;
+#else
+        mem = (char *)malloc(total_alloc);
+        if (!mem)
+            return -1;
+#endif
+
+        fragments = (char **)mem;
+        sizes = (int *)(mem + packet_count * sizeof(char *));
+        packet_data = mem + meta_size;
+        src = buf;
+        dst = packet_data;
+        remain = len;
+
+        for (i = 0; i < packet_count; ++i)
         {
-            size_t data_offset = i * body_size;
-            size_t size = Q_min(body_size, len - data_offset);
+            int chunk;
+            SPLITPACKET *hdr;
 
-            fragments[i] = fragment_data_block + i * fragment_size;
-            p = (SPLITPACKET *)fragments[i];
-            p->sequence_number = sequence_number;
-            p->net_id = NET_HEADER_SPLITPACKET;
-            p->packet_id = (i << 8) + packet_count;
+            chunk = (remain < (size_t)body_size) ? (int)remain : body_size;
 
-            memcpy(fragments[i] + sizeof(SPLITPACKET), buf + data_offset, size);
-            sizes[i] = sizeof(SPLITPACKET) + size;
-            total_size += size;
+            hdr = (SPLITPACKET *)dst;
+            memcpy(hdr, &base_hdr, hdr_size);
+            hdr->packet_id = ((int)i << 8) + (int)packet_count;
+
+            memcpy(dst + hdr_size, src, (size_t)chunk);
+
+            fragments[i] = dst;
+            sizes[i] = chunk + (int)hdr_size;
+
+            src += (size_t)chunk;
+            dst += per_packet_size;
+            remain -= (size_t)chunk;
         }
+
+        ret = sendto_batch(net_socket, fragments, sizes,
+                           (int)packet_count, flags,
+                           (const struct sockaddr_storage *)to, (int)tolen);
+
+        if (ret >= 0)
+        {
+            total_sent = ret - (int)packet_count * (int)hdr_size;
+            if (total_sent < 0)
+                total_sent = 0;
+        }
+        else
+        {
+            total_sent = ret;
+        }
+
+        free(mem);
+        return (ret < 0) ? ret : total_sent;
     }
-    else
+#else /* no NET_USE_SEND_BATCH */
     {
-        // Unfragmented path
-        sequence_number = ++net.sequence_number;
-        if (sequence_number <= 0)
-            sequence_number = net.sequence_number = 1;
+        /* ---- NON-BATCH MODE ---- */
+        const char *src;
+        size_t remain;
+        int total_sent;
+        int i;
+        char packet[SPLITPACKET_MAX_SIZE];
+        SPLITPACKET *hdr;
+        int chunk;
+        int ret;
 
-        fragments = malloc(sizeof(char *));
-        sizes = malloc(sizeof(size_t));
-        if (!fragments || !sizes)
-            goto cleanup;
+        if ((int)(hdr_size + (size_t)body_size) > SPLITPACKET_MAX_SIZE)
+            return -1;
 
-        fragments[0] = (char *)buf; // Just point, do not own
-        sizes[0] = len;
-        total_size = (int)len;
+        total_sent = 0;
+        src = buf;
+        remain = len;
+
+        for (i = 0; i < (int)packet_count; ++i)
+        {
+            chunk = (remain < (size_t)body_size) ? (int)remain : body_size;
+
+            hdr = (SPLITPACKET *)packet;
+            memcpy(hdr, &base_hdr, hdr_size);
+            hdr->packet_id = (i << 8) + (int)packet_count;
+
+            memcpy(packet + hdr_size, src, (size_t)chunk);
+
+            ret = sendto(net_socket, packet, chunk + (int)hdr_size,
+                         flags, (const struct sockaddr *)to, (int)tolen);
+            if (ret < 0)
+                return ret;
+
+            total_sent += chunk;
+            src += (size_t)chunk;
+            remain -= (size_t)chunk;
+        }
+
+        return total_sent;
     }
+#endif /* NET_USE_SEND_BATCH */
 
-    ret = g_sendto(sock, fragments, sizes, packet_count, sequence_number, to, tolen);
+#endif /* NET_USE_FRAGMENTS */
 
-cleanup:
-    if (fragment_data_block)
-        free(fragment_data_block);
-    free(fragments);
-    free(sizes);
-
-    return (ret < 0) ? ret : total_size;
+    /* Defensive fallback */
+    return -1;
 }
 
 /*
@@ -1758,7 +1872,6 @@ static void NET_OpenIP( qboolean change_port, int *sockets, const char *net_ifac
 	int port;
 	qboolean sv_nat = Cvar_VariableInteger( "sv_nat" );
 	qboolean cl_nat = Cvar_VariableInteger( "cl_nat" );
-	return;
 
 	if( change_port && ( FBitSet( net_hostport.flags, FCVAR_CHANGED ) || sv_nat ))
 	{
@@ -1922,19 +2035,19 @@ void NET_Config( qboolean multiplayer, qboolean changeport )
 			NET_OpenIP( changeport, net.ip6_sockets, net_ip6name.string, net_ip6hostport.value, net_ip6clientport.value, AF_INET6 );
 
 		// validate sockets for dedicated
-//		if( Host_IsDedicated( ))
-//		{
-//			qboolean nov4, nov6;
-//			nov4 = net.allow_ip  && NET_IsSocketError( net.ip_sockets[NS_SERVER] );
-//			nov6 = net.allow_ip6 && NET_IsSocketError( net.ip6_sockets[NS_SERVER] );
-//
-//			if( nov4 && nov6 )
-//				Host_Error( "Couldn't allocate IPv4 and IPv6 server ports.\n" );
-//			else if( nov4 && !nov6 )
-//				Con_Printf( S_ERROR "Couldn't allocate IPv4 server port\n" );
-//			else if( !nov4 && nov6 )
-//				Con_Printf( S_ERROR "Couldn't allocate IPv6 server_port\n" );
-//		}
+		if( Host_IsDedicated( ))
+		{
+			qboolean nov4, nov6;
+			nov4 = net.allow_ip  && NET_IsSocketError( net.ip_sockets[NS_SERVER] );
+			nov6 = net.allow_ip6 && NET_IsSocketError( net.ip6_sockets[NS_SERVER] );
+
+			if( nov4 && nov6 )
+				Host_Error( "Couldn't allocate IPv4 and IPv6 server ports.\n" );
+			else if( nov4 && !nov6 )
+				Con_Printf( S_ERROR "Couldn't allocate IPv4 server port\n" );
+			else if( !nov4 && nov6 )
+				Con_Printf( S_ERROR "Couldn't allocate IPv6 server_port\n" );
+		}
 
 		// get our local address, if possible
 		if( bFirst )
@@ -2110,9 +2223,7 @@ void NET_Init( void )
 	}
 #endif
 
-#ifdef CAN_ASYNC_NS_RESOLVE
 	NET_InitializeCriticalSections();
-#endif
 
 	net.allow_ip = !Sys_CheckParm( "-noip" );
 	net.allow_ip6 = !Sys_CheckParm( "-noip6" );
@@ -2165,9 +2276,7 @@ void NET_Shutdown( void )
 
 	NET_Config( false, false );
 
-#ifdef CAN_ASYNC_NS_RESOLVE
 	NET_DeleteCriticalSections();
-#endif
 
 #if XASH_WIN32
 	WSACleanup();
